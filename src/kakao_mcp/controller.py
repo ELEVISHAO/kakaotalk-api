@@ -5,6 +5,7 @@ import time
 import ctypes
 import shutil
 import hashlib
+import struct
 import subprocess
 import threading
 from collections import deque
@@ -379,6 +380,65 @@ def _copy_image_to_clipboard(file_path: str):
         win32clipboard.CloseClipboard()
 
 
+def _focus_chat_edit(hwnd: int, edit_hwnd: int) -> None:
+    """Focus RICHEDIT via AttachThreadInput + SetFocus (no mouse click)."""
+    kernel32 = ctypes.windll.kernel32
+    my_tid = kernel32.GetCurrentThreadId()
+    target_tid = _user32.GetWindowThreadProcessId(hwnd, None)
+    _user32.AttachThreadInput(my_tid, target_tid, True)
+    _user32.SetFocus(edit_hwnd)
+    _user32.AttachThreadInput(my_tid, target_tid, False)
+    time.sleep(config.IMAGE_SET_FOCUS_WAIT_SEC)
+
+
+def _wait_and_confirm_send_dialog(chat_hwnd: int) -> bool:
+    """Poll for KakaoTalk send confirmation dialog and press Enter.
+
+    Returns True if dialog appeared and Enter was sent.
+    """
+    dialog_hwnd = None
+    for _ in range(40):
+        time.sleep(config.IMAGE_DIALOG_POLL_INTERVAL_SEC)
+        fg = _user32.GetForegroundWindow()
+        if fg != chat_hwnd and fg != 0:
+            dialog_hwnd = fg
+            break
+
+    if dialog_hwnd is None:
+        return False
+
+    time.sleep(config.IMAGE_CONFIRM_WAIT_SEC)
+    _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
+    time.sleep(0.05)
+    _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
+    time.sleep(config.IMAGE_AFTER_CONFIRM_WAIT_SEC)
+    return True
+
+
+def _copy_files_to_clipboard_hdrop(file_paths: List[str]) -> None:
+    """Copy file path(s) to clipboard as CF_HDROP (Explorer-style file drop)."""
+    abs_paths = []
+    for p in file_paths:
+        abs_path = os.path.abspath(p)
+        if not os.path.isfile(abs_path):
+            raise FileNotFoundError(f"File not found: {abs_path}")
+        abs_paths.append(abs_path)
+
+    # DROPFILES + UTF-16LE path list terminated by double NUL
+    file_list = "\0".join(abs_paths) + "\0\0"
+    file_bytes = file_list.encode("utf-16le")
+    # DROPFILES: pFiles, pt.x, pt.y, fNC, fWide
+    dropfiles = struct.pack("<IIIII", 20, 0, 0, 0, 1)
+    data = dropfiles + file_bytes
+
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32con.CF_HDROP, data)
+    finally:
+        win32clipboard.CloseClipboard()
+
+
 def send_image_to_room(room_name: str, image_path: str) -> Dict:
     """Send an image file to a KakaoTalk chat room.
 
@@ -405,53 +465,19 @@ def send_image_to_room(room_name: str, image_path: str) -> Dict:
     if edit_hwnd is None:
         return {"success": False, "error": f"Edit control not found in '{room_name}'"}
 
-    # Copy image to clipboard as bitmap (CF_DIB) BEFORE bringing window
-    # to front — clipboard operations don't need foreground focus.
     try:
         _copy_image_to_clipboard(abs_path)
     except Exception as e:
         return {"success": False, "error": f"Failed to copy image to clipboard: {e}"}
 
-    # Bring KakaoTalk to front
     bring_window_to_front(hwnd)
     time.sleep(config.IMAGE_FOCUS_WAIT_SEC)
-
-    # Set keyboard focus to the RICHEDIT edit control using SetFocus.
-    # We use AttachThreadInput so that SetFocus works cross-process.
-    # Mouse click is avoided because it can accidentally hit images
-    # displayed in the chat list area above the edit control.
-    kernel32 = ctypes.windll.kernel32
-    my_tid = kernel32.GetCurrentThreadId()
-    target_tid = _user32.GetWindowThreadProcessId(hwnd, None)
-    _user32.AttachThreadInput(my_tid, target_tid, True)
-    _user32.SetFocus(edit_hwnd)
-    _user32.AttachThreadInput(my_tid, target_tid, False)
-    time.sleep(config.IMAGE_SET_FOCUS_WAIT_SEC)
-
-    # Paste (Ctrl+V) — triggers KakaoTalk's image send confirmation dialog
+    _focus_chat_edit(hwnd, edit_hwnd)
     _send_ctrl_key_combo(0x56)  # Ctrl+V
 
-    # Wait for the confirmation dialog to appear (it's a separate window).
-    # Poll until foreground changes from the chat window or timeout.
-    dialog_hwnd = None
-    for _ in range(40):  # up to ~6 seconds
-        time.sleep(config.IMAGE_DIALOG_POLL_INTERVAL_SEC)
-        fg = _user32.GetForegroundWindow()
-        if fg != hwnd and fg != 0:
-            dialog_hwnd = fg
-            break
-
-    if dialog_hwnd is None:
+    if not _wait_and_confirm_send_dialog(hwnd):
         _log("Image send dialog did not appear")
         return {"success": False, "error": "Image send confirmation dialog did not appear"}
-
-    # The dialog is already the foreground window.  Give it time to fully
-    # render, then press Enter to confirm.
-    time.sleep(config.IMAGE_CONFIRM_WAIT_SEC)
-    _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
-    time.sleep(0.05)
-    _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
-    time.sleep(config.IMAGE_AFTER_CONFIRM_WAIT_SEC)
 
     return {"success": True, "message": f"Image sent to '{room_name}': {os.path.basename(abs_path)}"}
 
@@ -476,6 +502,75 @@ def send_images_to_room(room_name: str, image_paths: List[str]) -> Dict:
     return {
         "success": sent_count > 0,
         "message": f"Sent {sent_count}/{len(image_paths)} image(s) to '{room_name}'",
+        "results": results,
+    }
+
+
+def send_file_to_room(room_name: str, file_path: str) -> Dict:
+    """Send a regular file attachment via CF_HDROP + Ctrl+V + confirm dialog."""
+    abs_path = os.path.abspath(file_path)
+    if not os.path.isfile(abs_path):
+        return {"success": False, "error": f"File not found: {abs_path}"}
+
+    hwnd = find_chat_window(room_name)
+    if hwnd is None:
+        return {"success": False, "error": f"Chat window '{room_name}' not found"}
+
+    edit_hwnd = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS)
+    if edit_hwnd is None:
+        return {"success": False, "error": f"Edit control not found in '{room_name}'"}
+
+    try:
+        _copy_files_to_clipboard_hdrop([abs_path])
+    except Exception as e:
+        return {"success": False, "error": f"Failed to copy file to clipboard: {e}"}
+
+    bring_window_to_front(hwnd)
+    time.sleep(config.IMAGE_FOCUS_WAIT_SEC)
+    _focus_chat_edit(hwnd, edit_hwnd)
+    _send_ctrl_key_combo(0x56)
+
+    if not _wait_and_confirm_send_dialog(hwnd):
+        _log("File send dialog did not appear")
+        return {"success": False, "error": "File send confirmation dialog did not appear"}
+
+    return {
+        "success": True,
+        "message": f"File sent to '{room_name}': {os.path.basename(abs_path)}",
+    }
+
+
+def send_files_to_room(room_name: str, file_paths: List[str]) -> Dict:
+    """Send multiple files one CF_HDROP paste at a time, in order."""
+    if not file_paths:
+        return {"success": False, "error": "No file paths provided"}
+
+    results = []
+    for i, path in enumerate(file_paths):
+        result = send_file_to_room(room_name, path)
+        results.append({
+            "path": path,
+            "file": os.path.basename(path),
+            "success": result["success"],
+            "detail": result.get("message") or result.get("error"),
+        })
+        if not result["success"]:
+            for skipped in file_paths[i + 1:]:
+                results.append({
+                    "path": skipped,
+                    "file": os.path.basename(skipped),
+                    "success": False,
+                    "skipped": True,
+                    "detail": "skipped after prior failure",
+                })
+            break
+        if i < len(file_paths) - 1:
+            time.sleep(config.IMAGE_BETWEEN_SEND_WAIT_SEC)
+
+    sent_count = sum(1 for r in results if r.get("success"))
+    return {
+        "success": sent_count == len(file_paths),
+        "message": f"Sent {sent_count}/{len(file_paths)} file(s) to '{room_name}'",
         "results": results,
     }
 

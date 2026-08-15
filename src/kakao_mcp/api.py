@@ -5,16 +5,20 @@ import sys
 from typing import Optional
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from kakao_mcp.config import AgentSettings, load_agent_settings
 from kakao_mcp.schemas import (
     ErrorCode,
     RoomOpenRequest,
+    SendFileRequest,
+    SendFilesRequest,
+    SendImageRequest,
+    SendMaterialsRequest,
     SendMessageRequest,
 )
-from kakao_mcp.service import KakaoService, get_service
+from kakao_mcp.service import KakaoService
 
 
 def normalize_client_ip(host: Optional[str]) -> str:
@@ -30,7 +34,14 @@ def create_app(
     service: Optional[KakaoService] = None,
 ) -> FastAPI:
     app = FastAPI(title="KakaoTalk Windows Agent", version="0.2.0")
-    svc = service or get_service(settings)
+    svc = service or KakaoService(settings=settings, enforce_file_root=True)
+    if service is None:
+        # keep singleton in sync for MCP coexistence in-process
+        from kakao_mcp import service as service_mod
+        service_mod._service = svc
+    else:
+        svc.settings = settings
+        svc.enforce_file_root = True
     app.state.settings = settings
     app.state.service = svc
 
@@ -42,7 +53,6 @@ def create_app(
             request.client.host if request.client else None
         )
         allow = settings.allow_ips
-        # Enforce allowlist when configured OR when non-loopback bind
         if allow:
             if client_host not in allow:
                 return JSONResponse(
@@ -87,6 +97,50 @@ def create_app(
         if isinstance(auth, JSONResponse):
             return auth
         return svc.send_message(body.room_name, body.message)
+
+    @app.post("/send/image")
+    def send_image(body: SendImageRequest, auth=Depends(require_auth)):
+        if isinstance(auth, JSONResponse):
+            return auth
+        return svc.send_image(body.room_name, body.image_path)
+
+    @app.post("/send/file")
+    def send_file(body: SendFileRequest, auth=Depends(require_auth)):
+        if isinstance(auth, JSONResponse):
+            return auth
+        return svc.send_file(body.room_name, body.file_path)
+
+    @app.post("/send/files")
+    def send_files(body: SendFilesRequest, auth=Depends(require_auth)):
+        if isinstance(auth, JSONResponse):
+            return auth
+        return svc.send_files(body.room_name, body.file_paths)
+
+    @app.post("/send/materials")
+    def send_materials(body: SendMaterialsRequest, auth=Depends(require_auth)):
+        if isinstance(auth, JSONResponse):
+            return auth
+        return svc.send_materials(
+            body.room_name, body.job_id, body.message, body.files
+        )
+
+    @app.post("/send/materials/upload")
+    async def send_materials_upload(
+        room_name: str = Form(...),
+        job_id: str = Form(...),
+        message: str = Form(""),
+        files: list[UploadFile] = File(default=[]),
+        auth=Depends(require_auth),
+    ):
+        if isinstance(auth, JSONResponse):
+            return auth
+        uploads: list[tuple[str, bytes]] = []
+        for f in files:
+            content = await f.read()
+            uploads.append((f.filename or "upload.bin", content))
+        return svc.save_upload_and_send_materials(
+            room_name, job_id, message, uploads
+        )
 
     @app.exception_handler(Exception)
     async def unhandled(_request: Request, exc: Exception):

@@ -45,28 +45,34 @@ def test_jobs_do_not_interleave():
     )
 
 
-def test_wait_timeout_when_worker_busy():
+def test_wait_timeout_does_not_stop_running_job():
+    """Timed-out waiter must not cancel an already-running job's work."""
     mgr = JobManager(wait_timeout_sec=0.2, exec_timeout_sec=30)
     mgr.start()
-    barrier = threading.Event()
-    done = threading.Event()
+    events: list[str] = []
+    release = threading.Event()
 
-    def blocker():
-        barrier.wait(timeout=5)
-        return "ok"
+    def long_job():
+        events.append("started")
+        release.wait(timeout=5)
+        events.append("finished")
+        return "done"
 
-    def run_blocker():
-        try:
-            mgr.submit(blocker)
-        finally:
-            done.set()
+    result_box: list[str] = []
 
-    threading.Thread(target=run_blocker).start()
+    def run_long():
+        result_box.append(mgr.submit(long_job))
+
+    t = threading.Thread(target=run_long)
+    t.start()
     time.sleep(0.05)
+    assert "started" in events
 
     with pytest.raises(JobWaitTimeout):
-        mgr.submit(lambda: "second", wait_timeout_sec=0.15)
+        mgr.submit(lambda: "other", wait_timeout_sec=0.1)
 
-    barrier.set()
-    done.wait(timeout=5)
+    release.set()
+    t.join(timeout=5)
+    assert result_box == ["done"]
+    assert "finished" in events
     mgr.stop()

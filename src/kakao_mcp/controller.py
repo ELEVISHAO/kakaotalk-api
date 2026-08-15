@@ -46,15 +46,20 @@ def is_kakaotalk_running() -> Dict:
 def find_chat_window(room_name: str) -> Optional[int]:
     """Find a chat window by exact title (room name).
 
+    Title comparison uses Unicode NFC normalization.
     Returns hwnd or None.
     """
+    expected = config.normalize_room_title(room_name)
     results: List[int] = []
 
     def _cb(hwnd, _):
         if win32gui.IsWindowVisible(hwnd):
             cls = win32gui.GetClassName(hwnd)
             title = win32gui.GetWindowText(hwnd)
-            if cls == config.KAKAO_CHAT_WINDOW_CLASS and title == room_name:
+            if (
+                cls == config.KAKAO_CHAT_WINDOW_CLASS
+                and config.normalize_room_title(title) == expected
+            ):
                 results.append(hwnd)
         return True
 
@@ -617,14 +622,10 @@ def _ensure_foreground(hwnd: int) -> bool:
     return fg == hwnd
 
 
-def search_and_open_room(room_name: str) -> Dict:
-    """Search for a chat room in KakaoTalk main window and open it.
+def _search_open_first_result(room_name: str) -> Dict:
+    """Run KakaoTalk search UI and press Enter on the first result.
 
-    Uses clipboard paste into the search Edit box (for Korean IME support),
-    then double-clicks the first search result in SearchListCtrl.
-
-    Returns:
-        Dict with success (bool) and message or error.
+    Does not interpret success by window title — callers must verify.
     """
     main_hwnd = win32gui.FindWindow(
         config.KAKAO_MAIN_WINDOW_CLASS, config.KAKAO_MAIN_WINDOW_TITLE
@@ -632,63 +633,123 @@ def search_and_open_room(room_name: str) -> Dict:
     if main_hwnd == 0:
         return {"success": False, "error": "KakaoTalk main window not found"}
 
-    # Ensure KakaoTalk is in the foreground before sending keyboard events
     if not _ensure_foreground(main_hwnd):
         _log("Warning: Could not bring KakaoTalk to foreground")
 
-    # Ctrl+F activates the search bar (Edit becomes visible and focused)
     edit_hwnd = _activate_search_and_get_edit(main_hwnd)
     if edit_hwnd is None:
         return {"success": False, "error": "Search box not found in KakaoTalk main window"}
 
-    # Clear any existing text in the Edit using EM_SETSEL + WM_CLEAR
     EM_SETSEL = 0x00B1
     WM_CLEAR = 0x0303
-    win32api.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)  # Select all
-    win32api.SendMessage(edit_hwnd, WM_CLEAR, 0, 0)     # Delete selected
+    win32api.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)
+    win32api.SendMessage(edit_hwnd, WM_CLEAR, 0, 0)
     time.sleep(config.EDIT_CLICK_WAIT_SEC)
 
-    # Type search text character by character using WM_CHAR
-    # This goes directly to the Edit control — no focus or clipboard needed
     for ch in room_name:
         win32api.SendMessage(edit_hwnd, config.WM_CHAR, ord(ch), 0)
         time.sleep(config.SEARCH_CHAR_INTERVAL_SEC)
     _log(f"Typed '{room_name}' into Edit via WM_CHAR")
-    time.sleep(config.SEARCH_RESULTS_WAIT_SEC)  # Wait for search results to populate
+    time.sleep(config.SEARCH_RESULTS_WAIT_SEC)
 
-    # Press Enter to open the first search result (already selected by default)
     _log("Pressing Enter to open first search result")
     _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
     _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
     time.sleep(config.SEARCH_OPEN_WAIT_SEC)
+    return {"success": True}
 
-    # Do NOT press Escape here — it would close the newly opened chat window
 
-    # Look for opened chat windows
-    all_windows = list_chat_windows()
-    _log(f"Open windows after search: {[w['title'] for w in all_windows]}")
-    for w in all_windows:
-        if w["title"] == room_name:
-            return {"success": True, "message": f"Opened chat room '{room_name}'", "hwnd": w["hwnd"]}
-    for w in all_windows:
-        if room_name in w["title"]:
-            return {
-                "success": True,
-                "message": f"Opened chat room '{w['title']}' (searched: '{room_name}')",
-                "hwnd": w["hwnd"],
-            }
-    if all_windows:
+def open_room_strict(room_name: str) -> Dict:
+    """Open a chat room and require exact window title match.
+
+    Never treats substring matches or arbitrary open windows as success.
+    """
+    expected = config.normalize_room_title(room_name)
+    status = is_kakaotalk_running()
+    if not status["running"]:
+        return {
+            "success": False,
+            "error_code": "KAKAOTALK_NOT_RUNNING",
+            "error": "KakaoTalk is not running",
+            "expected_room": room_name,
+        }
+
+    hwnd = find_chat_window(room_name)
+    if hwnd:
+        bring_window_to_front(hwnd)
+        return {"success": True, "hwnd": hwnd, "room_name": room_name,
+                "message": f"Chat room '{room_name}' already open"}
+
+    before = {w["hwnd"] for w in list_chat_windows()}
+    search_result = _search_open_first_result(room_name)
+    if not search_result["success"]:
+        return {
+            "success": False,
+            "error_code": "ROOM_NOT_FOUND",
+            "expected_room": room_name,
+            "error": search_result.get("error", "Search failed"),
+        }
+
+    hwnd = find_chat_window(room_name)
+    if hwnd:
         return {
             "success": True,
-            "message": f"Opened a chat window (title: '{all_windows[0]['title']}')",
-            "hwnd": all_windows[0]["hwnd"],
+            "hwnd": hwnd,
+            "room_name": room_name,
+            "message": f"Opened chat room '{room_name}'",
+        }
+
+    after = list_chat_windows()
+    _log(f"Open windows after search: {[w['title'] for w in after]}")
+    new_windows = [w for w in after if w["hwnd"] not in before]
+    if new_windows:
+        actual = new_windows[0]["title"]
+        return {
+            "success": False,
+            "error_code": "ROOM_MISMATCH",
+            "expected_room": room_name,
+            "actual_room": actual,
+            "error": f"Opened '{actual}' but expected '{room_name}'",
+        }
+
+    # No new window, but maybe an existing wrong title was focused — still not found
+    for w in after:
+        if config.normalize_room_title(w["title"]) == expected:
+            return {
+                "success": True,
+                "hwnd": w["hwnd"],
+                "room_name": room_name,
+                "message": f"Opened chat room '{room_name}'",
+            }
+
+    mismatched = [
+        w for w in after
+        if room_name in w["title"] or w["title"] in room_name
+    ]
+    if mismatched:
+        actual = mismatched[0]["title"]
+        return {
+            "success": False,
+            "error_code": "ROOM_MISMATCH",
+            "expected_room": room_name,
+            "actual_room": actual,
+            "error": f"Opened '{actual}' but expected '{room_name}'",
         }
 
     return {
         "success": False,
-        "error": f"Chat room '{room_name}' not found after search. "
-                 "The exact room name may differ from search results.",
+        "error_code": "ROOM_NOT_FOUND",
+        "expected_room": room_name,
+        "error": f"Chat room '{room_name}' not found after search",
     }
+
+
+def search_and_open_room(room_name: str) -> Dict:
+    """Search/open a room with strict exact title matching.
+
+    Deprecated fuzzy fallbacks removed. Prefer open_room_strict().
+    """
+    return open_room_strict(room_name)
 
 
 def _find_visible_search_list(main_hwnd: int) -> Optional[int]:

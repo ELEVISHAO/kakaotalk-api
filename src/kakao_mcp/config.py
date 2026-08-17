@@ -1,5 +1,7 @@
 """Central configuration for KakaoTalk MCP Server."""
 import os
+import unicodedata
+from dataclasses import dataclass
 
 # KakaoTalk window class names
 KAKAO_MAIN_WINDOW_CLASS = "EVA_Window_Dblclk"
@@ -75,3 +77,64 @@ DEFAULT_IMAGE_OUTPUT_DIR = os.path.join(
     os.environ.get("USERPROFILE", ""),
     "Documents", "KakaoMCP_Images"
 )
+
+
+# ---------------------------------------------------------------------------
+# HTTP Agent settings
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AgentSettings:
+    api_key: str
+    host: str
+    port: int
+    allow_ips: list[str]
+    allowed_file_root: str
+    max_file_size_mb: int
+    job_wait_timeout_sec: float
+    job_exec_timeout_sec: float
+    log_message_body: bool
+    webhook_url: str
+
+
+def _parse_allow_ips(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _is_loopback_host(host: str) -> bool:
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def load_agent_settings() -> AgentSettings:
+    api_key = os.environ.get("KAKAO_AGENT_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("KAKAO_AGENT_API_KEY is required to start kakaotalk-api")
+    host = os.environ.get("KAKAO_AGENT_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = int(os.environ.get("KAKAO_AGENT_PORT", "8765"))
+    allow_ips = _parse_allow_ips(os.environ.get("KAKAO_AGENT_ALLOW_IPS"))
+    if not _is_loopback_host(host) and not allow_ips:
+        raise RuntimeError("KAKAO_AGENT_ALLOW_IPS is required when host is not loopback")
+    wait = (
+        os.environ.get("KAKAO_JOB_WAIT_TIMEOUT_SEC")
+        or os.environ.get("KAKAO_JOB_TIMEOUT_SEC")
+        or "60"
+    )
+    return AgentSettings(
+        api_key=api_key,
+        host=host,
+        port=port,
+        allow_ips=allow_ips,
+        allowed_file_root=os.environ.get("KAKAO_ALLOWED_FILE_ROOT", r"C:\KakaoAgent\jobs"),
+        max_file_size_mb=int(os.environ.get("KAKAO_MAX_FILE_SIZE_MB", "100")),
+        job_wait_timeout_sec=float(wait),
+        job_exec_timeout_sec=float(os.environ.get("KAKAO_JOB_EXEC_TIMEOUT_SEC", "300")),
+        log_message_body=os.environ.get("KAKAO_LOG_MESSAGE_BODY", "").strip()
+        in ("1", "true", "TRUE"),
+        webhook_url=os.environ.get("KAKAO_AGENT_WEBHOOK_URL", "").strip(),
+    )
+
+
+def normalize_room_title(value: str) -> str:
+    return unicodedata.normalize("NFC", value)

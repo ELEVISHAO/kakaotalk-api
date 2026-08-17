@@ -219,28 +219,20 @@ def test_copy_image_to_clipboard_not_found(mock_abs, mock_isfile):
 # send_image_to_room
 # ---------------------------------------------------------------------------
 
-@patch("kakao_mcp.controller._copy_image_to_clipboard")
-@patch("kakao_mcp.controller.win32gui")
-@patch("kakao_mcp.controller._user32")
-@patch("kakao_mcp.controller._send_ctrl_key_combo")
+@patch("kakao_mcp.controller._post_files_wm_dropfiles")
+@patch("kakao_mcp.controller._wait_and_confirm_send_dialog", return_value=True)
 @patch("kakao_mcp.controller.bring_window_to_front")
-@patch("kakao_mcp.controller.find_child_window_recursive")
 @patch("kakao_mcp.controller.find_chat_window")
 @patch("os.path.splitext", return_value=("C:\\test\\image", ".jpg"))
 @patch("os.path.isfile", return_value=True)
 @patch("os.path.abspath", return_value="C:\\test\\image.jpg")
 def test_send_image_success(mock_abs, mock_isfile, mock_split, mock_find,
-                            mock_find_child, mock_bring, mock_ctrl,
-                            mock_user32, mock_win32gui, mock_copy):
+                            mock_bring, mock_wait, mock_post):
     mock_find.return_value = 11111
-    mock_find_child.return_value = 22222
-    mock_win32gui.GetWindowRect.return_value = (100, 100, 200, 120)
-    # Simulate dialog appearing (foreground changes to a different window)
-    mock_user32.GetForegroundWindow.side_effect = [11111, 33333]
     result = controller.send_image_to_room("TestRoom", "C:\\test\\image.jpg")
     assert result["success"] is True
     assert "sent" in result["message"].lower()
-    mock_copy.assert_called_once()
+    mock_post.assert_called_once_with(11111, ["C:\\test\\image.jpg"])
     mock_bring.assert_called_once()
 
 

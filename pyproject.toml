@@ -18,8 +18,12 @@ classifiers = [
     "Topic :: Communications :: Chat",
 ]
 dependencies = [
-    "mcp[cli]>=1.3.0",
+    "mcp[cli]>=1.3.0,<2",
     "pywin32>=306",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",
+    "httpx>=0.27.0",
 ]
 
 [project.urls]
@@ -29,6 +33,8 @@ Issues = "https://github.com/kronenz/kakaotalk-mcp/issues"
 
 [project.scripts]
 kakaotalk-mcp = "kakao_mcp.server:main"
+kakaotalk-api = "kakao_mcp.api:main"
+kakaotalk-panel = "kakao_mcp.panel:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kakao_mcp"]

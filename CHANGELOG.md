@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- HTTP Agent (`kakaotalk-api`): FastAPI with API key + IP allowlist
+- Shared `KakaoService` + serial `JobManager` for MCP and HTTP
+- Strict room open (`open_room_strict`); fuzzy search success removed
+- File send via CF_HDROP; materials JSON + multipart upload endpoints
+
+### Changed
+- MCP open/send go through KakaoService (exact room title); monitor tools disabled
+
 ## [0.2.0] - 2026-03-22
 
 ### Added

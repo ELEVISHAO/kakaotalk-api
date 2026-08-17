@@ -1,12 +1,113 @@
-# KakaoTalk MCP Server
+# KakaoTalk MCP Server / Windows HTTP Agent
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Windows](https://img.shields.io/badge/platform-Windows-0078d4.svg)](https://www.microsoft.com/windows)
 
+카카오톡 PC를 Win32 API로 제어합니다. 두 가지 진입점을 제공합니다:
+
+| 진입점 | 명령 | 용도 |
+|--------|------|------|
+| **HTTP Agent（生产）** | `kakaotalk-api` | Django / Celery / n8n 等业务系统直接调用 |
+| MCP Server | `kakaotalk-mcp` | Claude / Cursor 等 MCP 客户端（额外保留） |
+
+生产环境**不需要** Claude、Cursor、LLM 或 MCP Client。实际发送仍通过本机 KakaoTalk PC + Win32 完成。
+
+---
+
+## HTTP Agent（推荐生产用法）
+
+### 本机测试
+
+```text
+set KAKAO_AGENT_API_KEY=local-test-key
+set KAKAO_AGENT_HOST=127.0.0.1
+set KAKAO_AGENT_PORT=8765
+pip install -e .
+kakaotalk-api
+```
+
+```bash
+curl http://127.0.0.1:8765/health -H "X-API-Key: local-test-key"
+```
+
+本机绑定 `127.0.0.1` 时可不配置 IP 白名单。
+
+### 生产（业务服务器 → 闲置 Windows）
+
+```text
+set KAKAO_AGENT_API_KEY=<长随机密钥>
+set KAKAO_AGENT_HOST=0.0.0.0
+set KAKAO_AGENT_PORT=8765
+set KAKAO_AGENT_ALLOW_IPS=<业务服务器内网IP>
+set KAKAO_ALLOWED_FILE_ROOT=C:\KakaoAgent\jobs
+kakaotalk-api
+```
+
+- 禁止把 8765 端口映射到公网
+- Windows 防火墙入站只放行业务服务器 IP
+- 闲置电脑建议固定局域网 IP
+
+### 生产主路径：上传材料
+
+```bash
+curl -X POST http://WINDOWS_AGENT:8765/send/materials/upload \
+  -H "X-API-Key: SECRET" \
+  -F "room_name=한패스 고객센터" \
+  -F "job_id=GM-123456" \
+  -F "message=신규 개통 서류 전달드립니다." \
+  -F "files=@passport.pdf" \
+  -F "files=@application.jpg"
+```
+
+本机路径版（文件已在 Agent 机器上）：`POST /send/materials` JSON。
+
+### 其它 HTTP 接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/health` | KakaoTalk 是否在跑 |
+| GET | `/rooms` | 已开聊天窗 |
+| POST | `/rooms/open` | 严格精确 title 开房 |
+| POST | `/send/message` | 发文字 |
+| POST | `/send/image` | 发图片（WM_DROPFILES，路径须在允许根目录内） |
+| POST | `/send/file` | 发附件（WM_DROPFILES） |
+| POST | `/send/files` | 多附件，首败即停 |
+| POST | `/send/materials` | JSON 路径版材料发送 |
+| POST | `/send/materials/upload` | multipart 上传（生产主用） |
+
+鉴权：所有接口需要 `X-API-Key`。业务失败多为 HTTP **200** + `success: false`；缺/错 Key → **401**；IP 不在白名单 → **403**。
+
+响应只表示 UI 动作完成（`automation_success` / `UI_ACTION_COMPLETED`），**没有** `delivered` 字段。
+
+### 环境变量
+
+| 变量 | 默认 | 含义 |
+|------|------|------|
+| `KAKAO_AGENT_API_KEY` | （必填） | API Key |
+| `KAKAO_AGENT_HOST` | `127.0.0.1` | 监听地址 |
+| `KAKAO_AGENT_PORT` | `8765` | 端口 |
+| `KAKAO_AGENT_ALLOW_IPS` | 本机可空 | 逗号分隔来源 IP；非回环监听必填 |
+| `KAKAO_ALLOWED_FILE_ROOT` | `C:\KakaoAgent\jobs` | HTTP 文件根目录 |
+| `KAKAO_MAX_FILE_SIZE_MB` | `100` | 单文件大小上限 |
+| `KAKAO_JOB_WAIT_TIMEOUT_SEC` | `60` | 排队等待超时 → `AUTOMATION_BUSY` |
+| `KAKAO_JOB_EXEC_TIMEOUT_SEC` | `300` | 单次执行上限 |
+
+### Windows 开机启动
+
+任务计划程序 → 用户登录时 → 启动 `kakaotalk-api`（需已设置环境变量）。要求：Windows 已登录、KakaoTalk PC 已登录并运行。
+
+上传落盘目录会累积，请定期清理 `KAKAO_ALLOWED_FILE_ROOT` 下过期 job 目录。附件发送使用 `WM_DROPFILES`（模拟拖入聊天窗）；建议在目标电脑对当前 KakaoTalk 版本做一次真机验证。
+
+---
+
+## MCP Server（额外保留）
+
 카카오톡 PC를 Win32 API로 제어하는 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) 서버입니다.
 
 Claude Desktop, Claude Code 등 MCP 클라이언트에서 카카오톡 메시지를 보내고, 읽고, 채팅방을 관리할 수 있습니다.
+
+生产请只跑 `kakaotalk-api`，不要与 MCP 同时操作同一台 KakaoTalk。聊天室监控工具在本版本已禁用（`MONITOR_DISABLED`）。开房/发送走严格精确 title 匹配。
 
 ## 주요 기능
 
@@ -29,9 +130,9 @@ Claude Desktop, Claude Code 등 MCP 클라이언트에서 카카오톡 메시지
 
 | 도구 | 설명 |
 |------|------|
-| `kakao_start_monitor` | 채팅방 키워드 모니터링 시작 |
-| `kakao_stop_monitor` | 모니터링 중지 |
-| `kakao_get_monitor_events` | 감지된 키워드 이벤트 조회 |
+| `kakao_start_monitor` | （本版本禁用） |
+| `kakao_stop_monitor` | （本版本禁用） |
+| `kakao_get_monitor_events` | （本版本禁用） |
 
 ## 요구사항
 
@@ -188,14 +289,16 @@ kakaotalk-mcp/
 ├── src/
 │   └── kakao_mcp/
 │       ├── __init__.py
-│       ├── __main__.py      # python -m kakao_mcp 지원
-│       ├── server.py        # MCP 서버 + 13개 도구 정의
+│       ├── __main__.py      # python -m kakao_mcp → MCP
+│       ├── api.py           # FastAPI HTTP Agent (kakaotalk-api)
+│       ├── server.py        # MCP 服务器
+│       ├── service.py       # 共用业务层
+│       ├── job_manager.py   # UI 串行队列
+│       ├── schemas.py       # API 模型 / 错误码
 │       ├── controller.py    # Win32 API 래퍼
 │       ├── parser.py        # 클립보드 텍스트 파싱
-│       └── config.py        # 상수 및 설정
+│       └── config.py        # 상수 및 Agent 环境变量
 └── tests/
-    ├── test_parser.py       # 파서 단위 테스트
-    └── test_controller.py   # 컨트롤러 mock 테스트
 ```
 
 ## 라이선스

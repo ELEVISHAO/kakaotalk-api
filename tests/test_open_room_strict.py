@@ -27,14 +27,15 @@ def test_not_running(mock_run):
     assert r["error_code"] == "KAKAOTALK_NOT_RUNNING"
 
 
+@patch("kakao_mcp.controller.time.sleep")
 @patch("kakao_mcp.controller.list_chat_windows")
 @patch("kakao_mcp.controller._search_open_first_result", return_value={"success": True})
-@patch("kakao_mcp.controller.find_chat_window", side_effect=[None, None])
+@patch("kakao_mcp.controller.find_chat_window", return_value=None)
 @patch(
     "kakao_mcp.controller.is_kakaotalk_running",
     return_value={"running": True, "hwnd": 1, "pid": 2},
 )
-def test_mismatch_new_window(mock_run, mock_find, mock_search, mock_list):
+def test_mismatch_new_window(mock_run, mock_find, mock_search, mock_list, mock_sleep):
     mock_list.side_effect = [
         [],  # before
         [{"title": "한패스", "hwnd": 222}],  # after
@@ -46,14 +47,15 @@ def test_mismatch_new_window(mock_run, mock_find, mock_search, mock_list):
     assert r["expected_room"] == "한패스 고객센터"
 
 
+@patch("kakao_mcp.controller.time.sleep")
 @patch("kakao_mcp.controller.list_chat_windows", return_value=[])
 @patch("kakao_mcp.controller._search_open_first_result", return_value={"success": True})
-@patch("kakao_mcp.controller.find_chat_window", side_effect=[None, None])
+@patch("kakao_mcp.controller.find_chat_window", return_value=None)
 @patch(
     "kakao_mcp.controller.is_kakaotalk_running",
     return_value={"running": True, "hwnd": 1, "pid": 2},
 )
-def test_not_found(mock_run, mock_find, mock_search, mock_list):
+def test_not_found(mock_run, mock_find, mock_search, mock_list, mock_sleep):
     r = controller.open_room_strict("MissingRoom")
     assert r["success"] is False
     assert r["error_code"] == "ROOM_NOT_FOUND"
@@ -74,3 +76,21 @@ def test_no_any_window_success_in_source():
     assert "Opened a chat window" not in src
     src2 = inspect.getsource(controller.search_and_open_room)
     assert "Opened a chat window" not in src2
+
+
+@patch("kakao_mcp.controller.time.sleep")
+@patch("kakao_mcp.controller.list_chat_windows", return_value=[])
+@patch("kakao_mcp.controller._search_open_first_result", return_value={"success": True})
+@patch(
+    "kakao_mcp.controller.find_chat_window",
+    side_effect=[None, None, 333],  # window title becomes ready after 2 retries
+)
+@patch(
+    "kakao_mcp.controller.is_kakaotalk_running",
+    return_value={"running": True, "hwnd": 1, "pid": 2},
+)
+def test_window_title_ready_after_delay(mock_run, mock_find, mock_search, mock_list, mock_sleep):
+    """Race: after search opens the room, window title may take a moment to appear."""
+    r = controller.open_room_strict("한패스 고객센터")
+    assert r["success"] is True
+    assert r["hwnd"] == 333

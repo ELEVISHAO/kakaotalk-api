@@ -34,6 +34,7 @@ Issues = "https://github.com/kronenz/kakaotalk-mcp/issues"
 [project.scripts]
 kakaotalk-mcp = "kakao_mcp.server:main"
 kakaotalk-api = "kakao_mcp.api:main"
+kakaotalk-panel = "kakao_mcp.panel:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kakao_mcp"]

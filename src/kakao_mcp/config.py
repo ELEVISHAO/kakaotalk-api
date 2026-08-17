@@ -94,6 +94,7 @@ class AgentSettings:
     job_wait_timeout_sec: float
     job_exec_timeout_sec: float
     log_message_body: bool
+    webhook_url: str
 
 
 def _parse_allow_ips(raw: str | None) -> list[str]:
@@ -131,6 +132,7 @@ def load_agent_settings() -> AgentSettings:
         job_exec_timeout_sec=float(os.environ.get("KAKAO_JOB_EXEC_TIMEOUT_SEC", "300")),
         log_message_body=os.environ.get("KAKAO_LOG_MESSAGE_BODY", "").strip()
         in ("1", "true", "TRUE"),
+        webhook_url=os.environ.get("KAKAO_AGENT_WEBHOOK_URL", "").strip(),
     )
 
 

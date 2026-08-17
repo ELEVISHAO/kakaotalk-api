@@ -1,12 +1,14 @@
 """FastAPI HTTP server for KakaoTalk Windows Agent."""
 from __future__ import annotations
 
+import json
 import sys
 from typing import Optional
 
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from kakao_mcp.config import AgentSettings, load_agent_settings
 from kakao_mcp.schemas import (
@@ -19,6 +21,7 @@ from kakao_mcp.schemas import (
     SendMessageRequest,
 )
 from kakao_mcp.service import KakaoService
+from kakao_mcp.webhook import notify_failure_async
 
 
 def normalize_client_ip(host: Optional[str]) -> str:
@@ -29,11 +32,44 @@ def normalize_client_ip(host: Optional[str]) -> str:
     return host
 
 
+class _WebhookFailureMiddleware(BaseHTTPMiddleware):
+    """Send WeCom webhook notification for auth / business / server failures."""
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+        response = await call_next(request)
+        status = response.status_code
+        payload = None
+        needs_body = status >= 400 or (
+            status == 200
+            and "application/json" in response.headers.get("content-type", "")
+        )
+
+        if needs_body:
+            body_bytes = b""
+            async for chunk in response.body_iterator:  # type: ignore[attr-defined]
+                body_bytes += chunk if isinstance(chunk, bytes) else chunk.encode()
+            try:
+                payload = json.loads(body_bytes) if body_bytes else {}
+            except Exception:
+                payload = {}
+            response = JSONResponse(content=payload, status_code=status)
+
+        webhook_url = getattr(request.app.state.settings, "webhook_url", "") or ""
+        notify_failure_async(
+            webhook_url,
+            path=str(request.url.path),
+            status_code=status,
+            payload=payload,
+        )
+        return response
+
+
 def create_app(
     settings: AgentSettings,
     service: Optional[KakaoService] = None,
 ) -> FastAPI:
     app = FastAPI(title="KakaoTalk Windows Agent", version="0.2.0")
+    app.add_middleware(_WebhookFailureMiddleware)
     svc = service or KakaoService(settings=settings, enforce_file_root=True)
     if service is None:
         # keep singleton in sync for MCP coexistence in-process

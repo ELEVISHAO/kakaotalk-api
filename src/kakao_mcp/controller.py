@@ -9,6 +9,7 @@ import struct
 import subprocess
 import threading
 from collections import deque
+from ctypes import wintypes
 from typing import Optional, List, Dict
 
 import win32gui
@@ -156,6 +157,24 @@ def bring_window_to_front(hwnd: int):
 # ---------------------------------------------------------------------------
 
 _user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
+_kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+_kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+_kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+_kernel32.GlobalLock.restype = ctypes.c_void_p
+_kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+_user32.PostMessageW.argtypes = [
+    wintypes.HWND,
+    wintypes.UINT,
+    ctypes.c_size_t,
+    ctypes.c_size_t,
+]
+_user32.PostMessageW.restype = wintypes.BOOL
+
+WM_DROPFILES = 0x0233
+_GMEM_MOVEABLE = 0x0002
+_GMEM_ZEROINIT = 0x0040
+_GHND = _GMEM_MOVEABLE | _GMEM_ZEROINIT
 
 
 def _press_key(vk: int, shift: bool = False):
@@ -245,18 +264,25 @@ def send_message_to_room(room_name: str, text: str) -> Dict:
     except Exception:
         pass
 
+    _focus_chat_edit(hwnd, edit_hwnd)
+
     # Paste text via clipboard (handles Korean correctly, unlike WM_SETTEXT on some versions)
     win32clipboard.OpenClipboard()
     win32clipboard.EmptyClipboard()
     win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
     win32clipboard.CloseClipboard()
-    time.sleep(config.CLIPBOARD_PASTE_WAIT_SEC)
+    time.sleep(max(config.CLIPBOARD_PASTE_WAIT_SEC, 0.08))
     _send_ctrl_key_combo(0x56)  # Ctrl+V
-    time.sleep(config.AFTER_PASTE_WAIT_SEC)
+    time.sleep(max(config.AFTER_PASTE_WAIT_SEC, 0.15))
+
+    # Re-focus before Enter — materials/file flows can steal focus after paste
+    _focus_chat_edit(hwnd, edit_hwnd)
 
     # Press Enter using keybd_event (not WM_KEYDOWN — WM_KEYDOWN inserts newline in RICHEDIT)
     _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
+    time.sleep(0.05)
     _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
+    time.sleep(0.2)
 
     return {"success": True, "message": f"Message sent to '{room_name}'"}
 
@@ -391,13 +417,13 @@ def _focus_chat_edit(hwnd: int, edit_hwnd: int) -> None:
     time.sleep(config.IMAGE_SET_FOCUS_WAIT_SEC)
 
 
-def _wait_and_confirm_send_dialog(chat_hwnd: int) -> bool:
+def _wait_and_confirm_send_dialog(chat_hwnd: int, polls: int = 40) -> bool:
     """Poll for KakaoTalk send confirmation dialog and press Enter.
 
     Returns True if dialog appeared and Enter was sent.
     """
     dialog_hwnd = None
-    for _ in range(40):
+    for _ in range(polls):
         time.sleep(config.IMAGE_DIALOG_POLL_INTERVAL_SEC)
         fg = _user32.GetForegroundWindow()
         if fg != chat_hwnd and fg != 0:
@@ -415,8 +441,8 @@ def _wait_and_confirm_send_dialog(chat_hwnd: int) -> bool:
     return True
 
 
-def _copy_files_to_clipboard_hdrop(file_paths: List[str]) -> None:
-    """Copy file path(s) to clipboard as CF_HDROP (Explorer-style file drop)."""
+def _build_hdrop_bytes(file_paths: List[str]) -> bytes:
+    """Build DROPFILES + UTF-16LE path list for CF_HDROP / WM_DROPFILES."""
     abs_paths = []
     for p in file_paths:
         abs_path = os.path.abspath(p)
@@ -424,13 +450,16 @@ def _copy_files_to_clipboard_hdrop(file_paths: List[str]) -> None:
             raise FileNotFoundError(f"File not found: {abs_path}")
         abs_paths.append(abs_path)
 
-    # DROPFILES + UTF-16LE path list terminated by double NUL
     file_list = "\0".join(abs_paths) + "\0\0"
     file_bytes = file_list.encode("utf-16le")
     # DROPFILES: pFiles, pt.x, pt.y, fNC, fWide
     dropfiles = struct.pack("<IIIII", 20, 0, 0, 0, 1)
-    data = dropfiles + file_bytes
+    return dropfiles + file_bytes
 
+
+def _copy_files_to_clipboard_hdrop(file_paths: List[str]) -> None:
+    """Copy file path(s) to clipboard as CF_HDROP (legacy; prefer WM_DROPFILES)."""
+    data = _build_hdrop_bytes(file_paths)
     win32clipboard.OpenClipboard()
     try:
         win32clipboard.EmptyClipboard()
@@ -439,11 +468,54 @@ def _copy_files_to_clipboard_hdrop(file_paths: List[str]) -> None:
         win32clipboard.CloseClipboard()
 
 
-def send_image_to_room(room_name: str, image_path: str) -> Dict:
-    """Send an image file to a KakaoTalk chat room.
+def _post_files_wm_dropfiles(hwnd: int, file_paths: List[str]) -> None:
+    """Post WM_DROPFILES to a window (simulates dropping files onto it)."""
+    raw = _build_hdrop_bytes(file_paths)
+    hmem = _kernel32.GlobalAlloc(_GHND, len(raw))
+    if not hmem:
+        raise OSError("GlobalAlloc failed for WM_DROPFILES")
+    ptr = _kernel32.GlobalLock(hmem)
+    if not ptr:
+        raise OSError("GlobalLock failed for WM_DROPFILES")
+    try:
+        ctypes.memmove(ptr, raw, len(raw))
+    finally:
+        _kernel32.GlobalUnlock(hmem)
 
-    Copies the image to clipboard as bitmap data (CF_DIB), pastes via
-    Ctrl+V into the chat window, and confirms the send dialog.
+    ok = _user32.PostMessageW(hwnd, WM_DROPFILES, hmem, 0)
+    if not ok:
+        raise OSError("PostMessageW(WM_DROPFILES) failed")
+
+
+def _send_attachment_via_dropfiles(room_name: str, abs_path: str, label: str) -> Dict:
+    """Bring chat to front and drop a single file via WM_DROPFILES."""
+    hwnd = find_chat_window(room_name)
+    if hwnd is None:
+        return {"success": False, "error": f"Chat window '{room_name}' not found"}
+
+    bring_window_to_front(hwnd)
+    time.sleep(config.IMAGE_FOCUS_WAIT_SEC)
+
+    try:
+        _post_files_wm_dropfiles(hwnd, [abs_path])
+    except Exception as e:
+        return {"success": False, "error": f"Failed to drop {label.lower()}: {e}"}
+
+    # Some KakaoTalk builds show a separate confirm dialog; others accept the drop
+    # without changing the foreground window. Poll briefly, then accept.
+    if not _wait_and_confirm_send_dialog(hwnd, polls=10):
+        _log(f"No separate send dialog after WM_DROPFILES for {label.lower()}; treating as accepted")
+        time.sleep(config.IMAGE_AFTER_CONFIRM_WAIT_SEC)
+
+    return {
+        "success": True,
+        "message": f"{label} sent to '{room_name}': {os.path.basename(abs_path)}",
+    }
+
+
+def send_image_to_room(room_name: str, image_path: str) -> Dict:
+    """Send an image file to a KakaoTalk chat room via WM_DROPFILES.
+
     NOTE: This briefly brings the chat window to the foreground.
     """
     abs_path = os.path.abspath(image_path)
@@ -457,29 +529,7 @@ def send_image_to_room(room_name: str, image_path: str) -> Dict:
             "error": f"Unsupported image format '{ext}'. Supported: {', '.join(sorted(config.SUPPORTED_IMAGE_EXTENSIONS))}",
         }
 
-    hwnd = find_chat_window(room_name)
-    if hwnd is None:
-        return {"success": False, "error": f"Chat window '{room_name}' not found"}
-
-    edit_hwnd = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS)
-    if edit_hwnd is None:
-        return {"success": False, "error": f"Edit control not found in '{room_name}'"}
-
-    try:
-        _copy_image_to_clipboard(abs_path)
-    except Exception as e:
-        return {"success": False, "error": f"Failed to copy image to clipboard: {e}"}
-
-    bring_window_to_front(hwnd)
-    time.sleep(config.IMAGE_FOCUS_WAIT_SEC)
-    _focus_chat_edit(hwnd, edit_hwnd)
-    _send_ctrl_key_combo(0x56)  # Ctrl+V
-
-    if not _wait_and_confirm_send_dialog(hwnd):
-        _log("Image send dialog did not appear")
-        return {"success": False, "error": "Image send confirmation dialog did not appear"}
-
-    return {"success": True, "message": f"Image sent to '{room_name}': {os.path.basename(abs_path)}"}
+    return _send_attachment_via_dropfiles(room_name, abs_path, "Image")
 
 
 def send_images_to_room(room_name: str, image_paths: List[str]) -> Dict:
@@ -507,37 +557,12 @@ def send_images_to_room(room_name: str, image_paths: List[str]) -> Dict:
 
 
 def send_file_to_room(room_name: str, file_path: str) -> Dict:
-    """Send a regular file attachment via CF_HDROP + Ctrl+V + confirm dialog."""
+    """Send a regular file attachment via WM_DROPFILES."""
     abs_path = os.path.abspath(file_path)
     if not os.path.isfile(abs_path):
         return {"success": False, "error": f"File not found: {abs_path}"}
 
-    hwnd = find_chat_window(room_name)
-    if hwnd is None:
-        return {"success": False, "error": f"Chat window '{room_name}' not found"}
-
-    edit_hwnd = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS)
-    if edit_hwnd is None:
-        return {"success": False, "error": f"Edit control not found in '{room_name}'"}
-
-    try:
-        _copy_files_to_clipboard_hdrop([abs_path])
-    except Exception as e:
-        return {"success": False, "error": f"Failed to copy file to clipboard: {e}"}
-
-    bring_window_to_front(hwnd)
-    time.sleep(config.IMAGE_FOCUS_WAIT_SEC)
-    _focus_chat_edit(hwnd, edit_hwnd)
-    _send_ctrl_key_combo(0x56)
-
-    if not _wait_and_confirm_send_dialog(hwnd):
-        _log("File send dialog did not appear")
-        return {"success": False, "error": "File send confirmation dialog did not appear"}
-
-    return {
-        "success": True,
-        "message": f"File sent to '{room_name}': {os.path.basename(abs_path)}",
-    }
+    return _send_attachment_via_dropfiles(room_name, abs_path, "File")
 
 
 def send_files_to_room(room_name: str, file_paths: List[str]) -> Dict:
@@ -653,6 +678,21 @@ def _find_chat_list_view(main_hwnd: int) -> Optional[int]:
     return chat_list_view
 
 
+def _focus_search_edit(main_hwnd: int, edit_hwnd: int) -> None:
+    """Focus the search Edit via AttachThreadInput + SetFocus.
+
+    Required so that subsequent Ctrl+V (clipboard paste) lands in the search
+    box. Without real focus, global keybd_event keystrokes go elsewhere.
+    """
+    kernel32 = ctypes.windll.kernel32
+    my_tid = kernel32.GetCurrentThreadId()
+    target_tid = _user32.GetWindowThreadProcessId(main_hwnd, None)
+    _user32.AttachThreadInput(my_tid, target_tid, True)
+    _user32.SetFocus(edit_hwnd)
+    _user32.AttachThreadInput(my_tid, target_tid, False)
+    time.sleep(config.IMAGE_SET_FOCUS_WAIT_SEC)
+
+
 def _find_search_strip(chat_list_view: int) -> Optional[int]:
     """Find the search strip (EVA_Window_Dblclk, ~390x40) inside ChatRoomListView.
 
@@ -717,6 +757,49 @@ def _ensure_foreground(hwnd: int) -> bool:
     return fg == hwnd
 
 
+def _double_click_first_result(main_hwnd: int) -> bool:
+    """Double-click the first row of the visible search result list.
+
+    KakaoTalk opens a chat from search results on a real mouse double-click;
+    simulated Enter (SendMessage / keybd_event / SendInput) does not reliably
+    open it. Returns True if a search list was found and clicked.
+    """
+    search_list = None
+
+    def _cb(hwnd, _):
+        nonlocal search_list
+        try:
+            if win32gui.GetClassName(hwnd) == "EVA_VH_ListControl_Dblclk":
+                title = win32gui.GetWindowText(hwnd)
+                if "SearchListCtrl" in title and win32gui.IsWindowVisible(hwnd):
+                    search_list = hwnd
+                    return False
+        except Exception:
+            pass
+        return True
+
+    win32gui.EnumChildWindows(main_hwnd, _cb, None)
+    if search_list is None:
+        return False
+
+    rect = win32gui.GetWindowRect(search_list)
+    # click the first row (just inside the top of the list, centered)
+    x = rect[0] + (rect[2] - rect[0]) // 2
+    y = rect[1] + 15
+
+    bring_window_to_front(main_hwnd)
+    time.sleep(config.WINDOW_ACTIVATE_WAIT_SEC)
+    _user32.SetCursorPos(x, y)
+    time.sleep(0.1)
+    _user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+    _user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+    time.sleep(0.1)
+    _user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN (second click = double)
+    _user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+    time.sleep(config.SEARCH_OPEN_WAIT_SEC)
+    return True
+
+
 def _search_open_first_result(room_name: str) -> Dict:
     """Run KakaoTalk search UI and press Enter on the first result.
 
@@ -737,21 +820,50 @@ def _search_open_first_result(room_name: str) -> Dict:
 
     EM_SETSEL = 0x00B1
     WM_CLEAR = 0x0303
+    WM_SETTEXT = 0x000C
+    # Select all + clear the edit box so leftover text from a previous search
+    # does not concatenate with the new query. WM_SETTEXT("") is used in
+    # addition to WM_CLEAR so clearing works even when the box has no focus.
     win32api.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)
     win32api.SendMessage(edit_hwnd, WM_CLEAR, 0, 0)
+    win32api.SendMessage(edit_hwnd, WM_SETTEXT, 0, "")
     time.sleep(config.EDIT_CLICK_WAIT_SEC)
 
-    for ch in room_name:
-        win32api.SendMessage(edit_hwnd, config.WM_CHAR, ord(ch), 0)
-        time.sleep(config.SEARCH_CHAR_INTERVAL_SEC)
-    _log(f"Typed '{room_name}' into Edit via WM_CHAR")
+    # Give the search Edit real input focus so the clipboard paste below lands
+    # in it. Global keybd_event (Ctrl+V) only goes to the focused control.
+    _focus_search_edit(main_hwnd, edit_hwnd)
+
+    # Paste the query via clipboard (handles CJK/Korean correctly, unlike
+    # WM_CHAR which fills the visible text but does not trigger KakaoTalk's
+    # IME-based search index).
+    win32clipboard.OpenClipboard()
+    win32clipboard.EmptyClipboard()
+    win32clipboard.SetClipboardText(room_name, win32clipboard.CF_UNICODETEXT)
+    win32clipboard.CloseClipboard()
+    time.sleep(max(config.CLIPBOARD_PASTE_WAIT_SEC, 0.08))
+    _send_ctrl_key_combo(0x56)  # Ctrl+V
+    _log(f"Pasted '{room_name}' into Edit via clipboard")
     time.sleep(config.SEARCH_RESULTS_WAIT_SEC)
 
-    _log("Pressing Enter to open first search result")
-    _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
-    _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
-    time.sleep(config.SEARCH_OPEN_WAIT_SEC)
+    _log("Double-clicking first search result to open the room")
+    # KakaoTalk opens a chat from search results via a real double-click.
+    # Simulated Enter keys do not reliably open it (verified empirically).
+    _double_click_first_result(main_hwnd)
     return {"success": True}
+
+
+def _poll_find_chat_window(room_name: str, attempts: int = 10, interval: float = 0.2) -> Optional[int]:
+    """Poll for the chat window to appear after search opens it.
+
+    The window title may take a short while to become ready after Enter is
+    pressed on a search result. Retrying avoids a false ROOM_NOT_FOUND race.
+    """
+    for _ in range(attempts):
+        hwnd = find_chat_window(room_name)
+        if hwnd:
+            return hwnd
+        time.sleep(interval)
+    return None
 
 
 def open_room_strict(room_name: str) -> Dict:
@@ -785,7 +897,10 @@ def open_room_strict(room_name: str) -> Dict:
             "error": search_result.get("error", "Search failed"),
         }
 
-    hwnd = find_chat_window(room_name)
+    # Window title may take a moment to become ready after Enter opens it.
+    # Poll instead of single check to avoid a race where the room is actually
+    # open but title lookup runs too early and returns ROOM_NOT_FOUND.
+    hwnd = _poll_find_chat_window(room_name)
     if hwnd:
         return {
             "success": True,

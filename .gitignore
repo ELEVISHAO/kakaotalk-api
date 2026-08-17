@@ -7,3 +7,6 @@ build/
 .pytest_cache/
 .claude/
 test_images/
+.env
+agent.env
+.opencode/

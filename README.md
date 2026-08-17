@@ -70,8 +70,8 @@ curl -X POST http://WINDOWS_AGENT:8765/send/materials/upload \
 | GET | `/rooms` | 已开聊天窗 |
 | POST | `/rooms/open` | 严格精确 title 开房 |
 | POST | `/send/message` | 发文字 |
-| POST | `/send/image` | 发图片（CF_DIB，路径须在允许根目录内） |
-| POST | `/send/file` | 发附件（CF_HDROP） |
+| POST | `/send/image` | 发图片（WM_DROPFILES，路径须在允许根目录内） |
+| POST | `/send/file` | 发附件（WM_DROPFILES） |
 | POST | `/send/files` | 多附件，首败即停 |
 | POST | `/send/materials` | JSON 路径版材料发送 |
 | POST | `/send/materials/upload` | multipart 上传（生产主用） |
@@ -97,7 +97,7 @@ curl -X POST http://WINDOWS_AGENT:8765/send/materials/upload \
 
 任务计划程序 → 用户登录时 → 启动 `kakaotalk-api`（需已设置环境变量）。要求：Windows 已登录、KakaoTalk PC 已登录并运行。
 
-上传落盘目录会累积，请定期清理 `KAKAO_ALLOWED_FILE_ROOT` 下过期 job 目录。CF_HDROP 发文件建议在目标电脑对当前 KakaoTalk 版本做一次真机验证。
+上传落盘目录会累积，请定期清理 `KAKAO_ALLOWED_FILE_ROOT` 下过期 job 目录。附件发送使用 `WM_DROPFILES`（模拟拖入聊天窗）；建议在目标电脑对当前 KakaoTalk 版本做一次真机验证。
 
 ---
 

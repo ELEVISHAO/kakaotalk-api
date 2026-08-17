@@ -19,6 +19,7 @@ def _settings(**overrides) -> AgentSettings:
         job_wait_timeout_sec=60.0,
         job_exec_timeout_sec=300.0,
         log_message_body=False,
+        webhook_url="",
     )
     base.update(overrides)
     return AgentSettings(**base)

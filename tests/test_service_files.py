@@ -22,6 +22,7 @@ def _settings(root: Path) -> AgentSettings:
         job_wait_timeout_sec=60.0,
         job_exec_timeout_sec=300.0,
         log_message_body=False,
+        webhook_url="",
     )
 
 
@@ -91,9 +92,11 @@ def test_materials_partial_failure(tmp_path):
     )
     r = svc.send_materials("Room", "GM-1", "hello", [str(a), str(b)])
     assert r["success"] is False
-    assert r["message_sent"] is True
+    assert r["message_sent"] is False  # files-first: message skipped after file failure
     assert r["completed_files"] == 1
     assert r["failed_file"] == "b.pdf"
+    fake.send_message_to_room.assert_not_called()
+    fake.send_files_to_room.assert_called_once()
 
 
 def test_upload_saves_then_sends(tmp_path):

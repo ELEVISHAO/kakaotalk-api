@@ -371,20 +371,8 @@ class KakaoService:
         if not open_result.get("success"):
             return {**open_result, "job_id": job_id}
 
-        message_sent = False
-        if msg.strip():
-            send_result = self.ctrl.send_message_to_room(room_name, msg)
-            if not send_result.get("success"):
-                return {
-                    "success": False,
-                    "job_id": job_id,
-                    "room_name": room_name,
-                    "message_sent": False,
-                    "error_code": ErrorCode.MESSAGE_SEND_FAILED,
-                    "error": send_result.get("error", "Message send failed"),
-                }
-            message_sent = True
-
+        # Attachments first, then caption text. Doing text-before-files often left
+        # pasted text stuck in the edit box when Enter lost focus before WM_DROPFILES.
         files_out: list[dict] = []
         completed = 0
         if resolved:
@@ -410,7 +398,7 @@ class KakaoService:
                 self._log_send(
                     job_id=job_id,
                     room_name=room_name,
-                    message_sent=message_sent,
+                    message_sent=False,
                     files=[f["file"] for f in files_out],
                     success=False,
                     error_code=ErrorCode.FILE_SEND_FAILED,
@@ -422,12 +410,41 @@ class KakaoService:
                     "success": False,
                     "job_id": job_id,
                     "room_name": room_name,
-                    "message_sent": message_sent,
+                    "message_sent": False,
                     "error_code": ErrorCode.FILE_SEND_FAILED,
                     "completed_files": completed,
                     "failed_file": failed["file"] if failed else None,
                     "files": files_out,
                 }
+            if msg.strip():
+                time.sleep(0.4)
+
+        message_sent = False
+        if msg.strip():
+            send_result = self.ctrl.send_message_to_room(room_name, msg)
+            if not send_result.get("success"):
+                self._log_send(
+                    job_id=job_id,
+                    room_name=room_name,
+                    message_sent=False,
+                    files=[f["file"] for f in files_out],
+                    success=False,
+                    error_code=ErrorCode.MESSAGE_SEND_FAILED,
+                    error=send_result.get("error", "Message send failed"),
+                    duration=time.monotonic() - started,
+                    message=msg,
+                )
+                return {
+                    "success": False,
+                    "job_id": job_id,
+                    "room_name": room_name,
+                    "message_sent": False,
+                    "error_code": ErrorCode.MESSAGE_SEND_FAILED,
+                    "error": send_result.get("error", "Message send failed"),
+                    "files": files_out,
+                    "completed_files": completed,
+                }
+            message_sent = True
 
         self._log_send(
             job_id=job_id,
